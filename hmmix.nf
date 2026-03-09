@@ -7,79 +7,75 @@
  * 3. Create ingroup observations
  * 4. Train model per sample
  * 5. Decode results per sample
- *
- * Author: Kitty B Murphy
- * Date: 2025-06-20
- * Version: 1.1
  */
 
 workflow {
 
-    // Input channels / parameters
-    ind_ch        = file(params.ind)
-    weights_ch    =  Channel.value(file(params.weights))
+    // Check required parameters
+    if (!params.ind)       error "Please provide --ind"
+    if (!params.vcf)       error "Please provide --vcf"
+    if (!params.weights)   error "Please provide --weights"
+    if (!params.ancestral) error "Please provide --ancestral"
+    if (!params.refgenome) error "Please provide --refgenome"
+
+    // Input channels
+    ind_ch     = Channel.value(file(params.ind))
+    weights_ch = Channel.value(file(params.weights))
 
     // Step 1: Outgroup (skip if pre-made file provided)
-    create_outgroup_out = params.outgroup_file ?
-        [ outgroup: Channel.fromPath(params.outgroup_file) ] :
-        create_outgroup(
-            ind_ch,
-            params.vcf,           
-            weights_ch,
-            params.ancestral,     
-            params.refgenome      
-        )
+    outgroup_ch = params.outgroup_file ?
+    Channel.value(file(params.outgroup_file)) :
+    create_outgroup(ind_ch, params.vcf, weights_ch, params.ancestral, params.refgenome).outgroup
 
     // Step 2: Mutation rate (skip if pre-made file provided)
-    mut_rate_out = params.mutrate_file ?
-    [ mutrate: Channel.value(file(params.mutrate_file)) ] :
-    mutation_rate(create_outgroup_out.outgroup, weights_ch)
-
+    mutrate_ch = params.mutrate_file ?
+    Channel.value(file(params.mutrate_file)) :
+    mutation_rate(outgroup_ch, weights_ch).mutrate
 
     // Step 3: Create ingroup
     create_ingroup_out = create_ingroup(
         ind_ch,
-        params.vcf,           
+        params.vcf,
         weights_ch,
-        create_outgroup_out.outgroup,
-        params.ancestral      
+        outgroup_ch,
+        params.ancestral
     )
 
     // Prepare tuples for training
     obs_with_id_ch = create_ingroup_out.obs_files
-    .flatten()
-    .map { file ->
-        def id = file.name.replaceAll(/^obs\./, '').replaceAll(/\.txt$/, '')
-        tuple(id, file)
-    }
-  
+        .flatten()
+        .map { file ->
+            def id = file.name.replaceAll(/^obs\./, '').replaceAll(/\.txt$/, '')
+            tuple(id, file)
+        }
+
     // Step 4: Train model
-    train_model_out = train_model(obs_with_id_ch, weights_ch, mut_rate_out.mutrate)
+    train_model_out = train_model(obs_with_id_ch, weights_ch, mutrate_ch)
 
     trained_with_id_ch = train_model_out.trained_files
-    .flatten()
-    .map { file ->
-        def id = file.name.replaceAll(/^trained\./, '').replaceAll(/\.json$/, '')
-        tuple(id, file)
-    }
-
+        .flatten()
+        .map { file ->
+            def id = file.name.replaceAll(/^trained\./, '').replaceAll(/\.json$/, '')
+            tuple(id, file)
+        }
 
     // Step 5: Decode
     joined_ch = obs_with_id_ch.join(trained_with_id_ch)
-    decode_out = decode(joined_ch, weights_ch, mut_rate_out.mutrate)
+    decode(joined_ch, weights_ch, mutrate_ch)
 
 }
 
 
 process create_outgroup {
-    publishDir 'results/outgroup', mode: 'copy'
+    label 'light'
+    publishDir "${params.outDir}/outgroup", mode: 'copy'
 
     input:
-    file ind
-    val vcf_pattern
-    file weights
-    val ancestral_pattern
-    val refgenome_pattern
+    path ind
+    val  vcf_pattern
+    path weights
+    val  ancestral_pattern
+    val  refgenome_pattern
 
     output:
     path 'outgroup.txt', emit: outgroup
@@ -96,12 +92,14 @@ process create_outgroup {
     """
 }
 
+
 process mutation_rate {
-    publishDir 'results/mutation_rate', mode: 'copy'
+    label 'light'
+    publishDir "${params.outDir}/mutation_rate", mode: 'copy'
 
     input:
     path outgroup
-    file weights
+    path weights
 
     output:
     path 'mutation_rate.bed', emit: mutrate
@@ -116,20 +114,22 @@ process mutation_rate {
     """
 }
 
+
 process create_ingroup {
-    publishDir 'results/ingroup', mode: 'copy'
+    label 'create_ingroup'
+    publishDir "${params.outDir}/ingroup", mode: 'copy'
 
-    input: 
-    file ind 
-    val vcf_pattern
-    file weights 
-    path outgroup 
-    val ancestral_pattern
+    input:
+    path ind
+    val  vcf_pattern
+    path weights
+    path outgroup
+    val  ancestral_pattern
 
-    output: 
+    output:
     path 'obs.*', emit: obs_files
 
-    script: 
+    script:
     """
     hmmix create_ingroup \\
       -ind=${ind} \\
@@ -141,13 +141,15 @@ process create_ingroup {
     """
 }
 
+
 process train_model {
-    publishDir 'results/trained', mode: 'copy'
+    label 'train'
+    publishDir "${params.outDir}/trained", mode: 'copy'
 
     input:
     tuple val(id), path(obs_file)
-    file weights
-    file mutrate
+    path weights
+    path mutrate
 
     output:
     path 'trained.*.json', emit: trained_files
@@ -165,21 +167,26 @@ process train_model {
     """
 }
 
+
 process decode {
-    publishDir 'results/decoded', mode: 'copy'
+    label 'decode'
+    publishDir "${params.outDir}/decoded", mode: 'copy'
 
     input:
     tuple val(id), path(obs_file), path(trained_file)
     path weights
     path mutrate
 
-    output: 
-    path 'decoded.*', emit: decoded_files
+    output:
+    path 'decoded.*.txt',                  emit: decoded_files
+    path '*.posterior_probabilities.txt',  emit: posterior_probs_files, optional: true
 
-    script: 
+    script:
     """
     HAPLOID_FLAG=${params.haploid ? '-haploid' : ''}
     EXTRA_INFO_FLAG=${params.extra_info ? '-extrainfo' : ''}
+    ADMIX_POP=${params.admix_pop ? "-admixpop=${params.admix_pop}" : ''}
+    POSTERIOR_PROBS=${params.posterior_probs ? "-posterior_probs=${id}.posterior_probabilities.txt" : ''}
 
     hmmix decode \\
       -obs=${obs_file} \\
@@ -187,7 +194,9 @@ process decode {
       -mutrates=${mutrate} \\
       -param=${trained_file} \\
       \$HAPLOID_FLAG \\
+      \$ADMIX_POP \\
       \$EXTRA_INFO_FLAG \\
+      \$POSTERIOR_PROBS \\
       -out=decoded.${id}
     """
 }
